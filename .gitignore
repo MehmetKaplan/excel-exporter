@@ -1,0 +1,14 @@
+# Excel files (any directory, case-insensitive)
+**/*.[Xx][Ll][Ss]
+**/*.[Xx][Ll][Ss][Xx]
+**/*.[Xx][Ll][Ss][Mm]
+**/*.[Xx][Ll][Ss][Bb]
+**/*.[Xx][Ll][Tt]
+**/*.[Xx][Ll][Tt][Xx]
+**/*.[Xx][Ll][Tt][Mm]
+**/*.[Xx][Ll][Aa]
+**/*.[Xx][Ll][Aa][Mm]
+**/~$*.[Xx][Ll][Ss]*
+
+node_modules
+
