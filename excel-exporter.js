@@ -63,9 +63,14 @@ async function restoreConditionalFormatting(srcPath, outPath, sheetName, opts = 
   const srcCfBlocks =
     srcSheetXml.match(/<conditionalFormatting\b[\s\S]*?<\/conditionalFormatting>/g) || [];
   const hasSrcDv = /<dataValidations\b/.test(srcSheetXml);
-  // Nothing to restore (no classic CF and no data validations) → leave as-is.
-  // (Note: x14/extLst CF is not handled here.)
-  if (!srcCfBlocks.length && !hasSrcDv) return false;
+  // Source's worksheet-level x14 (extension-list) conditional formatting. This
+  // is the modern half of features like data bars — dropping it degrades or
+  // removes that formatting (e.g. the Gantt progress bars). Captured verbatim.
+  const srcX14CfExt = (srcSheetXml.match(
+    /<ext\b[^>]*>\s*<x14:conditionalFormattings>[\s\S]*?<\/x14:conditionalFormattings>\s*<\/ext>/
+  ) || [])[0] || '';
+  // Nothing to restore (no classic CF, no data validations, no x14 CF) → as-is.
+  if (!srcCfBlocks.length && !hasSrcDv && !srcX14CfExt) return false;
 
   const srcStyles = await srcZip.file('xl/styles.xml').async('string');
   const outStyles = await outZip.file('xl/styles.xml').async('string');
@@ -91,17 +96,26 @@ async function restoreConditionalFormatting(srcPath, outPath, sheetName, opts = 
 
   // Remap dxfId by the offset; optionally drop rules whose formula references
   // another sheet (so broken links don't leave dangling cross-sheet rules).
+  //
+  // A qualifier scan must ignore #REF! error literals: the "REF" in "#REF!"
+  // is NOT a sheet name. Treating it as one wrongly classifies same-sheet rules
+  // (e.g. a Gantt rule like AND(task_end>=I$7,task_start<#REF!)) as cross-sheet
+  // and silently deletes them, destroying the chart's formatting.
+  const stripErrLiterals = f => f.replace(/#REF!/g, '').replace(/#[A-Z0-9\/]+[!?]/g, '');
+  const formulaRefsOtherSheet = f => {
+    const decoded = stripErrLiterals(
+      f.replace(/&apos;/g, "'").replace(/&quot;/g, '"')
+    );
+    const qualifiers = [...decoded.matchAll(/(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_.]*))!/g)];
+    return qualifiers.some(q => (q[1] || q[2]) !== sheetName);
+  };
+
   const remapped = srcCfBlocks.map(block => {
     let b = block.replace(/dxfId="(\d+)"/g, (_, n) => `dxfId="${parseInt(n, 10) + offset}"`);
     if (opts.breakLinks) {
       b = b.replace(/<cfRule\b[\s\S]*?(?:\/>|<\/cfRule>)/g, rule => {
         const formulas = [...rule.matchAll(/<formula>([\s\S]*?)<\/formula>/g)].map(x => x[1]);
-        const refsOther = formulas.some(f => {
-          const decoded = f.replace(/&apos;/g, "'");
-          const qualifiers = [...decoded.matchAll(/(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_.]*))!/g)];
-          return qualifiers.some(q => (q[1] || q[2]) !== sheetName);
-        });
-        return refsOther ? '' : rule;
+        return formulas.some(formulaRefsOtherSheet) ? '' : rule;
       });
       if (!/<cfRule\b/.test(b)) return '';
     }
@@ -121,12 +135,7 @@ async function restoreConditionalFormatting(srcPath, outPath, sheetName, opts = 
       srcDvBlock = srcDvBlock.replace(
         /<dataValidation\b[\s\S]*?(?:\/>|<\/dataValidation>)/g, dv => {
           const formulas = [...dv.matchAll(/<formula\d?>([\s\S]*?)<\/formula\d?>/g)].map(x => x[1]);
-          const refsOther = formulas.some(f => {
-            const decoded = f.replace(/&apos;/g, "'").replace(/&quot;/g, '"');
-            const qualifiers = [...decoded.matchAll(/(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_.]*))!/g)];
-            return qualifiers.some(q => (q[1] || q[2]) !== sheetName);
-          });
-          return refsOther ? '' : dv;
+          return formulas.some(formulaRefsOtherSheet) ? '' : dv;
         });
       // Recount after possible drops.
       const remaining = (srcDvBlock.match(/<dataValidation\b/g) || []).length;
@@ -142,6 +151,37 @@ async function restoreConditionalFormatting(srcPath, outPath, sheetName, opts = 
     /<conditionalFormatting\b[\s\S]*?<\/conditionalFormatting>/g, ''
   );
 
+  // --- x14 (extension-list) conditional formatting -----------------------
+  // Under breakLinks, drop x14 rules whose formula (<xm:f>) references another
+  // sheet. x14 CF uses <xm:f> for formulas and <xm:sqref> for ranges, so the
+  // <formula>-based filter above does not apply to it.
+  let x14Ext = srcX14CfExt;
+  if (x14Ext && opts.breakLinks) {
+    x14Ext = x14Ext.replace(
+      /<x14:conditionalFormatting\b[\s\S]*?<\/x14:conditionalFormatting>/g, cf => {
+        const formulas = [...cf.matchAll(/<xm:f>([\s\S]*?)<\/xm:f>/g)].map(x => x[1]);
+        return formulas.some(formulaRefsOtherSheet) ? '' : cf;
+      });
+    // If every inner rule was dropped, discard the now-empty container.
+    if (!/<x14:conditionalFormatting\b/.test(x14Ext)) x14Ext = '';
+  }
+  // The x14 CF block references the x14 namespaces; ensure they are declared on
+  // the <worksheet> root (ExcelJS usually omits xmlns:x14 and xmlns:xm). The
+  // ext itself already declares xmlns:x14; xm is declared on the inner element
+  // in Excel's output, but we add both on the root defensively.
+  if (x14Ext) {
+    outSheetXml = outSheetXml.replace(/<worksheet\b([^>]*)>/, (m, attrs) => {
+      let a = attrs;
+      if (!/xmlns:x14=/.test(a)) {
+        a += ' xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"';
+      }
+      if (!/xmlns:xm=/.test(a)) {
+        a += ' xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"';
+      }
+      return `<worksheet${a}>`;
+    });
+  }
+
   // Re-insert in schema order: conditionalFormatting, then dataValidations,
   // both after sheetData and before pageMargins.
   const cfInsert = remapped.join('');
@@ -155,8 +195,101 @@ async function restoreConditionalFormatting(srcPath, outPath, sheetName, opts = 
     );
   }
 
+  // Insert x14 CF into a worksheet-level <extLst>, which per schema must be the
+  // LAST child of <worksheet> (after pageSetup). Merge into an existing
+  // worksheet-level extLst if ExcelJS wrote one; otherwise create it.
+  if (x14Ext) {
+    // Only match a worksheet-level extLst: the one immediately before
+    // </worksheet>. (Inline dataBar extLst blocks live inside cfRule and never
+    // sit at the end of the sheet.)
+    const trailingExtLst = /<extLst>([\s\S]*?)<\/extLst>\s*<\/worksheet>\s*$/;
+    if (trailingExtLst.test(outSheetXml)) {
+      outSheetXml = outSheetXml.replace(trailingExtLst,
+        (m, inner) => `<extLst>${inner}${x14Ext}</extLst></worksheet>`);
+    } else {
+      outSheetXml = outSheetXml.replace(/<\/worksheet>\s*$/,
+        `<extLst>${x14Ext}</extLst></worksheet>`);
+    }
+  }
+
   outZip.file('xl/styles.xml', newStyles);
   outZip.file(outSheetPath, outSheetXml);
+  fs.writeFileSync(outPath, await outZip.generateAsync({ type: 'nodebuffer' }));
+  return true;
+}
+// -------------------------------------------------------------------------
+
+// --- Defined-name restoration --------------------------------------------
+// ExcelJS drops the workbook's <definedNames> entirely. That silently breaks
+// any formula — including conditional-formatting formulas — that refers to a
+// name. The Project Plan Gantt colours its day cells with rules like
+//   AND(task_start<=I$7, ... task_end ...)
+// where task_start/task_end/task_progress are sheet-scoped names. With the
+// names gone, those expressions can't evaluate and nothing gets coloured.
+//
+// We graft back every name that still resolves in the single-sheet output:
+//   * names scoped (localSheetId) to the exported sheet, and
+//   * workbook-scoped names whose target is the exported sheet,
+// rewriting localSheetId to 0 (the lone output sheet). Names that point at
+// other sheets, or whose definition contains #REF!, are dropped.
+async function restoreDefinedNames(srcPath, outPath, sheetName) {
+  const srcZip = await JSZip.loadAsync(fs.readFileSync(srcPath));
+  const outZip = await JSZip.loadAsync(fs.readFileSync(outPath));
+
+  const srcWbXml = await srcZip.file('xl/workbook.xml').async('string');
+  const outWbXml = await outZip.file('xl/workbook.xml').async('string');
+
+  // Order of <sheet> elements in the SOURCE workbook → localSheetId indices.
+  const srcSheetNames = [...srcWbXml.matchAll(/<sheet\b[^>]*\bname="([^"]+)"/g)].map(x => x[1]);
+  const exportedIdxInSrc = srcSheetNames.indexOf(sheetName);
+
+  const nameBlocks = [...srcWbXml.matchAll(/<definedName\b([^>]*)>([\s\S]*?)<\/definedName>/g)];
+  if (!nameBlocks.length) return false;
+
+  const escName = sheetName.replace(/'/g, "''");
+  // A definition targets the exported sheet if it is qualified with that sheet
+  // name (quoted or bare).
+  const targetsExportedSheet = def => {
+    const decoded = def.replace(/&apos;/g, "'").replace(/&quot;/g, '"');
+    const quals = [...decoded.matchAll(/(?:'([^']+)'|([A-Za-z_\u00A0-\uFFFF][A-Za-z0-9_.\u00A0-\uFFFF ]*))!/g)];
+    if (!quals.length) return true; // unqualified (e.g. TODAY()) → keep
+    return quals.every(q => (q[1] || q[2]) === sheetName);
+  };
+
+  const kept = [];
+  for (const m of nameBlocks) {
+    const attrs = m[1];
+    const def = m[2];
+    if (/#REF!/.test(def)) continue;            // broken definition
+    const localM = attrs.match(/\blocalSheetId="(\d+)"/);
+    if (localM) {
+      // Sheet-scoped: keep only if scoped to the exported sheet.
+      if (parseInt(localM[1], 10) !== exportedIdxInSrc) continue;
+    } else {
+      // Workbook-scoped: keep only if its target is the exported sheet.
+      if (!targetsExportedSheet(def)) continue;
+    }
+    // Rewrite (or add) localSheetId to 0 — the single sheet in the output.
+    let newAttrs = attrs.replace(/\s*\blocalSheetId="\d+"/, '');
+    newAttrs += ' localSheetId="0"';
+    kept.push(`<definedName${newAttrs}>${def}</definedName>`);
+  }
+
+  if (!kept.length) return false;
+  const definedNamesEl = `<definedNames>${kept.join('')}</definedNames>`;
+
+  // Insert per schema: after </sheets>, before <calcPr> (or before </workbook>
+  // if no calcPr). Replace an existing definedNames block if present.
+  let newWbXml;
+  if (/<definedNames>[\s\S]*?<\/definedNames>/.test(outWbXml)) {
+    newWbXml = outWbXml.replace(/<definedNames>[\s\S]*?<\/definedNames>/, definedNamesEl);
+  } else if (/<\/sheets>/.test(outWbXml)) {
+    newWbXml = outWbXml.replace(/<\/sheets>/, `</sheets>${definedNamesEl}`);
+  } else {
+    newWbXml = outWbXml.replace(/<\/workbook>/, `${definedNamesEl}</workbook>`);
+  }
+
+  outZip.file('xl/workbook.xml', newWbXml);
   fs.writeFileSync(outPath, await outZip.generateAsync({ type: 'nodebuffer' }));
   return true;
 }
@@ -454,6 +587,12 @@ async function main() {
   await restoreConditionalFormatting(inputFile, outPath, sheetName, {
     breakLinks: mode === 'links',
   });
+
+  // Restore defined names that resolve to the exported sheet. CF formulas and
+  // cell formulas that reference names (e.g. the Gantt's task_start/task_end/
+  // task_progress) can only evaluate — and therefore colour cells — when the
+  // names exist in the output workbook.
+  await restoreDefinedNames(inputFile, outPath, sheetName);
 
   console.log(`Exported "${sheetName}" -> ${outPath}`);
 }
